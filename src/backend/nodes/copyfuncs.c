@@ -730,6 +730,7 @@ _copyHashJoin(const HashJoin *from)
 	 * copy remainder of node
 	 */
 	COPY_NODE_FIELD(hashclauses);
+	COPY_NODE_FIELD(params);
 
 	return newnode;
 }
@@ -1272,6 +1273,21 @@ _copyOpExpr(const OpExpr *from)
 	COPY_SCALAR_FIELD(inputcollid);
 	COPY_NODE_FIELD(args);
 	COPY_LOCATION_FIELD(location);
+
+	return newnode;
+}
+
+/*
+ * _copyStarJoinExpr
+ */
+static StarJoinExpr *
+_copyStarJoinExpr(const StarJoinExpr *from)
+{
+	StarJoinExpr	   *newnode = makeNode(StarJoinExpr);
+
+	COPY_NODE_FIELD(args);
+	COPY_LOCATION_FIELD(location);
+	COPY_NODE_FIELD(params);
 
 	return newnode;
 }
@@ -4167,6 +4183,9 @@ copyObject(const void *from)
 		case T_OpExpr:
 			retval = _copyOpExpr(from);
 			break;
+	case T_StarJoinExpr:
+		retval = _copyStarJoinExpr(from);
+		break;
 		case T_DistinctExpr:
 			retval = _copyDistinctExpr(from);
 			break;

@@ -23,6 +23,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
 #include "optimizer/tlist.h"
+#include "optimizer/subselect.h"
 #include "tcop/utility.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -67,6 +68,14 @@ typedef struct
 	Index		newvarno;
 	int			rtoffset;
 } fix_upper_expr_context;
+
+typedef struct
+{
+	PlannerInfo *root;
+	Plan *outer_plan;
+	List *join_clause;
+	int paramid;
+} fix_star_qual_context;
 
 /*
  * Check if a Const node is a regclass value.  We accept plain OID too,
@@ -134,6 +143,8 @@ static List *set_returning_clause_references(PlannerInfo *root,
 static bool fix_opfuncids_walker(Node *node, void *context);
 static bool extract_query_dependencies_walker(Node *node,
 								  PlannerInfo *context);
+static Node *fix_star_qual(PlannerInfo *root, Plan *outer_plan, List *join_clause);
+static Node *fix_star_qual_mutator(Plan *current_node, fix_star_qual_context *context);
 
 
 /*****************************************************************************
@@ -1284,6 +1295,14 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 	outer_itlist = build_tlist_index(outer_plan->targetlist);
 	inner_itlist = build_tlist_index(inner_plan->targetlist);
 
+	if (IsA(join, HashJoin))
+	{
+		HashJoin   *hj = (HashJoin *) join;
+
+
+		fix_star_qual(root, &(hj->join.plan), hj->hashclauses);
+	}
+
 	/* All join plans have tlist, qual, and joinqual */
 	join->plan.targetlist = fix_join_expr(root,
 										  join->plan.targetlist,
@@ -1826,6 +1845,171 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 								   (void *) context);
 }
 
+/* fix_star_qual
+ * fix_star_qual is used for pushing down join quals in HashJoin nodes for
+ * star schema join cases.
+ */
+static Node*
+fix_star_qual(PlannerInfo *root, Plan *outer_plan, List *join_clause)
+{
+	fix_star_qual_context context;
+	int paramid = -1;
+
+	context.root = root;
+	context.outer_plan = outer_plan;
+	context.join_clause = join_clause;
+
+	paramid = SS_assign_special_param(root);
+
+	context.paramid = paramid;
+
+	return (Node *) fix_star_qual_mutator(outer_plan, &context);
+}
+
+static Node*
+fix_star_qual_mutator(Plan *current_node, fix_star_qual_context *context)
+{
+	StarJoinExpr *str_expr = makeNode(StarJoinExpr);
+
+	if (current_node == NULL)
+		return NULL;
+
+	if (IsA(current_node, HashJoin))
+	{
+		HashJoin *current_hashjoin = (HashJoin *) current_node;
+		Node *ret_node;
+
+		if (!((current_hashjoin->join.jointype == JOIN_INNER) ||
+			(current_hashjoin->join.jointype == JOIN_SEMI) ||
+			  (current_hashjoin->join.jointype == JOIN_ANTI)))
+			return (Node *) current_node;
+
+		current_hashjoin->params = list_make1_int(context->paramid);
+
+		ret_node = fix_star_qual_mutator((current_node->lefttree), context);
+
+		if (ret_node)
+		{
+			StarJoinExpr *current_sjexpr = (StarJoinExpr *) (ret_node);
+
+			current_sjexpr->params = list_make1_int(context->paramid);
+
+			return (Node *) current_sjexpr;
+		}
+
+		return ret_node;
+	}
+	else if (IsA(current_node, MergeJoin))
+	{
+		MergeJoin *current_mergejoin = (MergeJoin *) current_node;
+
+		if (!((current_mergejoin->join.jointype == JOIN_INNER) ||
+			(current_mergejoin->join.jointype == JOIN_SEMI) ||
+			  (current_mergejoin->join.jointype == JOIN_ANTI)))
+			return NULL;
+
+		return (Node *) (fix_star_qual_mutator((current_node->lefttree), context));
+	}
+	else if (IsA(current_node, NestLoop))
+	{
+		NestLoop *current_nestloop = (NestLoop *) current_node;
+
+		if (!((current_nestloop->join.jointype == JOIN_INNER) ||
+			  (current_nestloop->join.jointype == JOIN_SEMI) ||
+			  (current_nestloop->join.jointype == JOIN_ANTI)))
+			return NULL;
+
+		return (Node *) (fix_star_qual_mutator((current_node->lefttree), context));
+	}
+	else if (IsA(current_node, SeqScan) || IsA(current_node, IndexScan))
+	{
+		List *current_tlist = NIL;
+		ListCell *tlist_lc;
+		ListCell *joinclause_lc;
+
+		if (IsA(current_node, SeqScan))
+			current_tlist = ((SeqScan*) (current_node))->plan.targetlist;
+		else if (IsA(current_node, IndexScan))
+			current_tlist = ((IndexScan*) (current_node))->scan.plan.targetlist;
+		else if (IsA(current_node, Append))
+		{
+			Append *current_appendnode = (Append *) current_node;
+			ListCell *lc_subplans;
+
+			foreach(lc_subplans, (current_appendnode->appendplans))
+			{
+				Plan *current_subplan = (Plan *) lfirst(lc_subplans);
+
+				fix_star_qual_mutator(current_subplan, context);
+			}
+		}
+
+		forboth (tlist_lc, current_tlist, joinclause_lc, context->join_clause)
+		{
+			OpExpr *current_opexpr = (OpExpr *) lfirst(joinclause_lc);
+			TargetEntry *current_tentry = (TargetEntry *) lfirst(tlist_lc);
+			Var *current_tlistvar = (Var *) (current_tentry->expr);
+			Var *current_opexprvar = (Var *) linitial(current_opexpr->args);
+			Var *copy_object = NULL;
+
+			if (((current_tlistvar->varno) == (current_opexprvar->varno)) &&
+				((current_tlistvar->varattno) == (current_opexprvar->varattno)))
+			{
+				copy_object = (Var *) copyObject(current_opexprvar);
+
+				if (str_expr->args == NULL)
+				{
+					str_expr->args = list_make1(copy_object);
+				}
+				else
+				{
+					lappend(str_expr->args, copy_object);
+				}
+			}
+		}
+
+		if (IsA(current_node, SeqScan))
+		{
+			SeqScan *current_seqscan = (SeqScan *) (current_node);
+
+			if (str_expr != NULL)
+			{
+				if (current_seqscan->plan.qual == NULL)
+				{
+					List *temp_str = list_make1(str_expr);
+
+					current_seqscan->plan.qual = temp_str;
+				}
+				else
+				{
+					current_seqscan->plan.qual = lappend((current_seqscan->plan.qual), str_expr);
+				}
+			}
+		}
+		else if (IsA(current_node, IndexScan))
+		{
+			IndexScan *current_indexscan = (IndexScan *) (current_node);
+
+			if (str_expr != NULL)
+			{
+				if (current_indexscan->scan.plan.qual == NULL)
+				{
+					List *temp_str = list_make1(str_expr);
+
+					current_indexscan->scan.plan.qual = temp_str;
+				}
+				else
+				{
+					current_indexscan->scan.plan.qual = lappend((current_indexscan->scan.plan.qual), str_expr);
+				}
+			}
+		}
+
+		return (Node *) str_expr;
+	}
+
+	return NULL;
+}
 /*
  * fix_upper_expr
  *		Modifies an expression tree so that all Var nodes reference outputs

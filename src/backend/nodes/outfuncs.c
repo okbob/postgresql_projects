@@ -635,6 +635,7 @@ _outHashJoin(StringInfo str, const HashJoin *node)
 	_outJoinPlanInfo(str, (const Join *) node);
 
 	WRITE_NODE_FIELD(hashclauses);
+	WRITE_NODE_FIELD(params);
 }
 
 static void
@@ -1052,6 +1053,16 @@ _outOpExpr(StringInfo str, const OpExpr *node)
 	WRITE_OID_FIELD(inputcollid);
 	WRITE_NODE_FIELD(args);
 	WRITE_LOCATION_FIELD(location);
+}
+
+static void
+_outStarJoinExpr(StringInfo str, const StarJoinExpr *node)
+{
+	WRITE_NODE_TYPE("STARJOINEXPR");
+
+	WRITE_NODE_FIELD(args);
+	WRITE_LOCATION_FIELD(location);
+	WRITE_NODE_FIELD(params);
 }
 
 static void
@@ -2975,6 +2986,9 @@ _outNode(StringInfo str, const void *obj)
 			case T_OpExpr:
 				_outOpExpr(str, obj);
 				break;
+		case T_StarJoinExpr:
+			_outStarJoinExpr(str, obj);
+			break;
 			case T_DistinctExpr:
 				_outDistinctExpr(str, obj);
 				break;
